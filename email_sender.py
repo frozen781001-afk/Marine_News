@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+email_sender.py  v2.3
+海事航運新聞監控系統 — Email 發送模組
+職責：HTML 渲染 + SMTP 發送
+v2.3 更新：
+  - ★ 安全性修正：Email 帳密改回環境變數讀取（不再硬編碼於原始碼）
+  - ★ 可靠性修正：SMTP 發送加入重試機制（預設 3 次，遞增等待）
+  - ★ 可靠性修正：send() 明確區分「無新聞跳過」與「真正發送失敗」
+v2.2 更新：
+  - 移除「11大航商」來源群組
+  - 移除 carrier_summary_row / carrier_note
+  - 簡化 render_hit_rows
+  - EMAIL_SUBTITLE 補上鋰電池/貨櫃落海/偷渡/毒品走私
+修改此檔案不影響爬蟲邏輯
+"""
+
+import os
+import re
+import time
+import smtplib
+import logging
+import traceback
+from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+logger = logging.getLogger(__name__)
+
+
+class EmailConfigError(RuntimeError):
+    """Email 設定缺漏或不完整時拋出，訊息明確指出缺少哪個環境變數。"""
+    pass
+
+
+class EmailSendError(RuntimeError):
+    """SMTP 發送在所有重試後仍失敗時拋出，讓呼叫端可以正確 exit(1)。"""
+    pass
+
+
+# ══════════════════════════════════════════════════════════════
+# Email 設定
+# ══════════════════════════════════════════════════════════════
+class EmailConfig:
+    """
+    所有 Email 相關設定集中於此。
+    ★ v2.3：帳密／收件人一律從環境變數讀取（.env 或 GitHub Secrets），
+      不得寫死在原始碼。缺少必要變數時，NewsEmailSender 會在初始化時
+      立即拋出 EmailConfigError，訊息會明確指出是哪一個變數沒有設定。
+    """
+    # ── SMTP 設定（可用環境變數覆寫，否則採用 Gmail 預設）───────
+    SMTP_SERVER: str = os.environ.get("MAIL_SMTP_SERVER", "smtp.gmail.com")
+    SMTP_PORT:   int = int(os.environ.get("MAIL_SMTP_PORT", "587"))
+
+    # ── 帳號設定（必填，從環境變數 / .env 讀取）──────────────────
+    MAIL_USER:    str = os.environ.get("MAIL_USER", "")
+    MAIL_PASS:    str = os.environ.get("MAIL_PASSWORD", "")
+    TARGET_EMAIL: str = os.environ.get("TARGET_EMAIL", "")
+
+    # ── SMTP 重試設定 ─────────────────────────────────────────
+    SEND_MAX_ATTEMPTS:   int = int(os.environ.get("MAIL_SEND_MAX_ATTEMPTS", "3"))
+    SEND_RETRY_WAIT_SEC: int = int(os.environ.get("MAIL_SEND_RETRY_WAIT_SEC", "15"))
+
+    # ── 郵件外觀設定 ──────────────────────────────────────────
+    SENDER_NAME:    str = "海事航運監控系統"
+    SUBJECT_PREFIX: str = "GITHUB_Maritime Intel News Alert"
+
+    # ── 版面文字設定 ──────────────────────────────────────────
+    EMAIL_TITLE:    str = "🚢 海事航運新聞監控快報"
+    EMAIL_SUBTITLE: str = (
+        "火災(含鋰電池) · 碰撞(含撞橋) · 擱淺沉沒(含貨櫃落海) · "
+        "海盜攻擊(含偷渡/毒品走私) · 船員傷亡 · 其他海事動態"
+    )
+    EMAIL_BRANDING: str = "Present by Marine Technology Division_FRM"
+    FOOTER_LINE1:   str = "此內容為系統自動發送，請勿直接回覆。"
+    FOOTER_LINE2:   str = (
+        "Maritime News Monitoring System · "
+        "Powered by WHL Fleet Risk Management"
+    )
+
+    # ── 分類副標題（顯示於每個分類區塊標題列下方）────────────
+    CAT_SUBTITLES: dict = {
+        "CAT1": "🔋 含鋰電池火災 · EV 載車船 · RoRo 火災",
+        "CAT2": "🌉 含橋梁撞擊 · 礁石觸礁 · 海峽擱淺",
+        "CAT3": "📦 含貨櫃落海 · 船舶全損 · 沉船事故",
+        "CAT4": "🚶 含偷渡事件 · 毒品走私 · 索馬利亞／幾內亞灣海盜",
+        "CAT5": "",
+        "CAT6": "",
+        "OTHER": "",
+    }
+
+    # ── 版面寬度 ──────────────────────────────────────────────
+    EMAIL_WIDTH: int = 720
+
+    # ── 時區（TPE = UTC+8）────────────────────────────────────
+    DISPLAY_TZ_OFFSET: int = 8
+    DISPLAY_TZ_NAME:   str = "TPE"
+
+
+# ══════════════════════════════════════════════════════════════
+# HTML 渲染器
+# ══════════════════════════════════════════════════════════════
+class EmailRenderer:
+    """
+    ⚠ DEPRECATED（Phase 4）：這是 Phase 1-3 的舊版「新聞列表」渲染器，
+    以 category/article 為單位排版，不含 Priority / Risk Scoring /
+    Event Clustering / Management Summary。
+
+    Phase 4 起，主管日常 Email 一律改用 executive_email_renderer.py 的
+    ExecutiveEmailRenderer（Event-based、Rule-Based Management Summary、
+    Overall Risk）。本類別保留但不再是 production 預設路徑 —— 只在需要
+    還原/比對舊版行為，或 Executive Email pipeline 尚未完全驗證前的
+    備援路徑時才會用到。不得刪除（§Phase4 執行原則：不完全取代前不可
+    刪除舊版 Renderer）。
+
+    負責將 news_data dict 渲染成完整 HTML 字串。
+    所有視覺樣式集中在此，修改版面只需動這個類別。
+    """
+
+    KW_COLOR_MAP: dict = {
+        "#dc2626": ("#fef2f2", "#dc2626"),
+        "#b45309": ("#fffbeb", "#b45309"),
+        "#7c3aed": ("#f5f3ff", "#7c3aed"),
+        "#0369a1": ("#eff6ff", "#0369a1"),
+        "#047857": ("#ecfdf5", "#047857"),
+        "#0891b2": ("#ecfeff", "#0891b2"),
+        "#475569": ("#f1f5f9", "#475569"),
+    }
+
+    DARKER_COLOR_MAP: dict = {
+        "#dc2626": "#b91c1c",
+        "#b45309": "#92400e",
+        "#7c3aed": "#6d28d9",
+        "#0369a1": "#075985",
+        "#047857": "#065f46",
+        "#0891b2": "#0e7490",
+        "#475569": "#334155",
+    }
+
+    LANG_BADGE: dict = {
+        "en":    ("#dbeafe", "#1d4ed8", "EN"),
+        "zh-TW": ("#dcfce7", "#15803d", "中文"),
+        "zh-CN": ("#fef9c3", "#854d0e", "中文"),
+    }
+
+    def __init__(self, incident_categories: dict,
+                 rss_sources: list, cnyes_sources: list):
+        self.cats          = incident_categories
+        self.rss_sources   = rss_sources
+        self.cnyes_sources = cnyes_sources
+        self._tz           = timezone(timedelta(hours=EmailConfig.DISPLAY_TZ_OFFSET))
+
+    # ── 工具：時間轉換 ────────────────────────────────────────
+    def _fmt_pub_time(self, pub: str) -> str:
+        if pub == '時間未知':
+            return pub
+        try:
+            dt = datetime.strptime(pub, '%Y-%m-%d %H:%M UTC').replace(
+                tzinfo=timezone.utc)
+            return dt.astimezone(self._tz).strftime('%m/%d %H:%M')
+        except Exception:
+            return pub
+
+    # ── 工具：HTML 轉義 ───────────────────────────────────────
+    @staticmethod
+    def _esc(text: str) -> str:
+        return (text
+                .replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;'))
+
+    # ─────────────────────────────────────────────────────────
+    # 元件 1：單篇新聞卡片
+    # ─────────────────────────────────────────────────────────
+    def render_card(self, item: dict) -> str:
+        cat_cfg      = self.cats.get(item.get('incident_cat', 'OTHER'),
+                                     self.cats.get('OTHER', {}))
+        border_color = cat_cfg.get('color', '#475569')
+        pub          = self._fmt_pub_time(item['published'])
+
+        lang     = item.get('source_lang', 'en')
+        badge    = self.LANG_BADGE.get(lang, self.LANG_BADGE['en'])
+        lang_bg, lang_fg, lang_text = badge
+
+        safe_title   = self._esc(item.get('title',   ''))
+        safe_summary = self._esc(item.get('summary', ''))
+
+        kw_cells = ""
+        for kw, _label, color in item.get('matched', [])[:3]:
+            bg_c, fg_c = self.KW_COLOR_MAP.get(color, ("#f1f5f9", "#475569"))
+            kw_cells += (
+                f'<td bgcolor="{bg_c}" '
+                f'style="padding:4px 10px;border:1px solid {fg_c};">'
+                f'<font face="Arial,Microsoft JhengHei,sans-serif" '
+                f'size="1" color="{fg_c}"><b>{self._esc(kw)}</b></font>'
+                f'</td><td width="6"></td>'
+            )
+
+        link = item.get('link', '#')
+        return f"""
+        <table width="100%" border="0" cellpadding="0" cellspacing="0"
+              bgcolor="#ffffff" style="margin-bottom:14px;border:1px solid #cbd5e1;">
+        <tr>
+          <td width="5" bgcolor="{border_color}" style="padding:0;">&nbsp;</td>
+          <td style="padding:16px 18px;">
+
+            <!-- 來源列 -->
+            <table width="100%" border="0" cellpadding="0" cellspacing="0"><tr>
+              <td align="left" valign="middle">
+                <font face="Microsoft JhengHei,Arial,sans-serif" size="2" color="#64748b">
+                  {item.get('source_icon','')}&nbsp;{self._esc(item.get('source_name',''))}
+                </font>&nbsp;
+                <table border="0" cellpadding="0" cellspacing="0"
+                      style="display:inline-table;"><tr>
+                  <td bgcolor="{lang_bg}" style="padding:3px 8px;">
+                    <font face="Arial,sans-serif" size="1"
+                          color="{lang_fg}"><b>{lang_text}</b></font>
+                  </td>
+                </tr></table>
+              </td>
+              <td align="right" valign="middle">
+                <font face="Arial,sans-serif" size="2" color="#94a3b8">
+                  🕐&nbsp;{pub}
+                </font>
+              </td>
+            </tr></table>
+
+            <!-- 標題 -->
+            <table width="100%" border="0" cellpadding="0" cellspacing="0"
+                  style="margin-top:10px;"><tr><td>
+              <a href="{link}" target="_blank" style="text-decoration:none;">
+                <font face="Microsoft JhengHei,Arial,sans-serif"
+                      size="4" color="#0f172a"><b>{safe_title}</b></font>
+              </a>
+            </td></tr></table>
+
+            <!-- 摘要 -->
+            <table width="100%" border="0" cellpadding="10" cellspacing="0"
+                  bgcolor="#f8fafc"
+                  style="margin-top:10px;border-left:3px solid {border_color};"><tr><td>
+              <font face="Microsoft JhengHei,Arial,sans-serif"
+                    size="2" color="#475569">
+                {safe_summary or '（無摘要）'}
+              </font>
+            </td></tr></table>
+
+            <!-- 關鍵字 + 閱讀按鈕 -->
+            <table width="100%" border="0" cellpadding="0" cellspacing="0"
+                  style="margin-top:12px;"><tr>
+              <td align="left" valign="middle">
+                <table border="0" cellpadding="0" cellspacing="0"><tr>
+                  {kw_cells}
+                </tr></table>
+              </td>
+              <td align="right" valign="middle">
+                <table border="0" cellpadding="8" cellspacing="0"
+                      bgcolor="{border_color}"><tr><td>
+                  <a href="{link}" target="_blank" style="text-decoration:none;">
+                    <font face="Arial,sans-serif" size="2" color="#ffffff">
+                      <b>閱讀原文 &rarr;</b>
+                    </font>
+                  </a>
+                </td></tr></table>
+              </td>
+            </tr></table>
+
+          </td>
+        </tr>
+        </table>"""
+
+    # ─────────────────────────────────────────────────────────
+    # 元件 2：單一情境分類區塊
+    # ─────────────────────────────────────────────────────────
+    def render_incident_section(self, cat_key: str, news_list: list) -> str:
+        cfg = self.cats[cat_key]
+
+        if not news_list:
+            return f"""
+<table width="100%" border="0" cellpadding="0" cellspacing="0"
+       style="margin-bottom:10px;border:1px solid #e2e8f0;">
+  <tr>
+    <td width="5" bgcolor="{cfg['color']}">&nbsp;</td>
+    <td bgcolor="#ffffff" style="padding:12px 16px;">
+      <table width="100%" border="0" cellpadding="0" cellspacing="0"><tr>
+        <td valign="middle">
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="3" color="{cfg['color']}">
+            <b>{cfg['icon']}&nbsp;{cfg['label']}</b>
+          </font>
+        </td>
+        <td align="right" valign="middle">
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="2" color="#94a3b8">本期無相關新聞</font>
+        </td>
+      </tr></table>
+    </td>
+  </tr>
+</table>"""
+
+        cards    = "".join(self.render_card(item) for item in news_list)
+        count_bg = self.DARKER_COLOR_MAP.get(cfg['color'], "#334155")
+
+        subtitle = EmailConfig.CAT_SUBTITLES.get(cat_key, "")
+        subtitle_row = ""
+        if subtitle:
+            subtitle_row = (
+                f'<br>'
+                f'<font face="Microsoft JhengHei,Arial,sans-serif" '
+                f'size="1" color="rgba(255,255,255,0.75)">'
+                f'{subtitle}'
+                f'</font>'
+            )
+
+        return f"""
+<table width="100%" border="0" cellpadding="0" cellspacing="0"
+       style="margin-bottom:20px;border:1px solid #e2e8f0;">
+  <tr>
+    <td bgcolor="{cfg['color']}" style="padding:12px 18px;">
+      <table width="100%" border="0" cellpadding="0" cellspacing="0"><tr>
+        <td align="left" valign="middle">
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="4" color="#ffffff">
+            <b>{cfg['icon']}&nbsp;{cfg['label']}</b>
+          </font>
+          {subtitle_row}
+        </td>
+        <td align="right" valign="middle" width="60">
+          <table border="0" cellpadding="6" cellspacing="0"
+                 bgcolor="{count_bg}"><tr><td align="center">
+            <font face="Arial,sans-serif" size="2" color="#ffffff">
+              <b>{len(news_list)} 則</b>
+            </font>
+          </td></tr></table>
+        </td>
+      </tr></table>
+    </td>
+  </tr>
+  <tr>
+    <td bgcolor="{cfg['bg']}" style="padding:16px 16px 2px 16px;">
+      {cards}
+    </td>
+  </tr>
+</table>"""
+
+    # ─────────────────────────────────────────────────────────
+    # 元件 3：統計格（頂部數字列）
+    # ─────────────────────────────────────────────────────────
+    def render_stat_cell(self, cat_key: str, count: int) -> str:
+        cfg = self.cats[cat_key]
+        if count > 0:
+            return f"""
+<td align="center" bgcolor="{cfg['color']}"
+    style="padding:16px 4px;width:12%;border-right:1px solid #ffffff;">
+  <font face="Arial,sans-serif" size="6" color="#ffffff"><b>{count}</b></font><br><br>
+  <font face="Arial,sans-serif" size="3" color="#ffffff">{cfg['icon']}</font><br>
+  <font face="Microsoft JhengHei,Arial,sans-serif"
+        size="2" color="#ffffff">{cfg['label']}</font>
+</td>"""
+        return f"""
+<td align="center" bgcolor="#f8fafc"
+    style="padding:16px 4px;width:12%;border-right:1px solid #e2e8f0;">
+  <font face="Arial,sans-serif" size="6" color="#cbd5e1"><b>0</b></font><br><br>
+  <font face="Arial,sans-serif" size="3" color="#cbd5e1">{cfg['icon']}</font><br>
+  <font face="Microsoft JhengHei,Arial,sans-serif"
+        size="2" color="#64748b">{cfg['label']}</font>
+</td>"""
+
+    # ─────────────────────────────────────────────────────────
+    # 元件 4：來源格線
+    # ─────────────────────────────────────────────────────────
+    def render_source_grid(self) -> str:
+        SOURCE_GROUPS = [
+            {
+                "title":   "中文媒體（台灣）",
+                "icon":    "🇹🇼",
+                "color":   "#059669",
+                "bg":      "#f0fdf4",
+                "border":  "#bbf7d0",
+                "sources": (
+                    [s for s in self.rss_sources
+                     if s.get("lang") == "zh-TW"
+                     and s.get("category") == "中文媒體"] +
+                    [s for s in self.cnyes_sources
+                     if s.get("lang") == "zh-TW"]
+                ),
+            },
+            {
+                "title":   "中文媒體（大陸）",
+                "icon":    "🇨🇳",
+                "color":   "#dc2626",
+                "bg":      "#fff5f5",
+                "border":  "#fecaca",
+                "sources": [s for s in self.rss_sources
+                            if s.get("lang") == "zh-CN"
+                            and s.get("category") == "中文媒體"],
+            },
+            {
+                "title":   "航運專業媒體",
+                "icon":    "🚢",
+                "color":   "#2563eb",
+                "bg":      "#f0f7ff",
+                "border":  "#bfdbfe",
+                "sources": [s for s in self.rss_sources
+                            if s.get("category") == "航運專業"],
+            },
+            {
+                "title":   "國際媒體",
+                "icon":    "🌐",
+                "color":   "#ea580c",
+                "bg":      "#fff7ed",
+                "border":  "#fed7aa",
+                "sources": [s for s in self.rss_sources
+                            if s.get("category") == "國際媒體"],
+            },
+        ]
+
+        groups_html = ""
+        for grp in SOURCE_GROUPS:
+            sources = grp["sources"]
+            if not sources:
+                continue
+
+            rows_html = ""
+            for i in range(0, len(sources), 3):
+                chunk = sources[i:i+3]
+                while len(chunk) < 3:
+                    chunk.append(None)
+                cells = ""
+                for src in chunk:
+                    if src is None:
+                        cells += (
+                            f'<td width="33%" bgcolor="{grp["bg"]}" '
+                            f'style="padding:8px 10px;'
+                            f'border-right:1px solid {grp["border"]};"></td>'
+                        )
+                    else:
+                        name = src.get("name", "")
+                        icon = src.get("icon", "📰")
+                        url  = src.get("url") or src.get("api_url", "")
+                        if url in ("__oneshipping_html__",
+                                   "__reddit_ships__",
+                                   "__reddit_maritime__",
+                                   "__reddit_shipping__"):
+                            url_map = {
+                                "__oneshipping_html__": "https://www.oneshipping.info",
+                                "__reddit_ships__":     "https://www.reddit.com/r/Ships",
+                                "__reddit_maritime__":  "https://www.reddit.com/r/maritime",
+                                "__reddit_shipping__":  "https://www.reddit.com/r/shipping",
+                            }
+                            url = url_map.get(url, url)
+                        display_url = url
+                        for rsshub in ("rsshub.app/", "rsshub.rssforever.com/"):
+                            if rsshub in url:
+                                bk = src.get("backup_url", "")
+                                if (bk and "rsshub" not in bk
+                                        and bk not in (
+                                            "__oneshipping_html__",
+                                            "__reddit_ships__",
+                                            "__reddit_maritime__",
+                                            "__reddit_shipping__",
+                                        )):
+                                    display_url = bk
+                                break
+                        domain = re.sub(
+                            r'^https?://(www\.)?', '', display_url
+                        ).split('/')[0]
+                        cells += f"""
+<td width="33%" bgcolor="{grp['bg']}"
+    style="padding:10px;border-right:1px solid {grp['border']};">
+  <table border="0" cellpadding="0" cellspacing="0" width="100%"><tr>
+    <td width="28" valign="middle" align="center">
+      <font size="3">{icon}</font>
+    </td>
+    <td valign="middle" style="padding-left:4px;">
+      <font face="Microsoft JhengHei,Arial,sans-serif"
+            size="2" color="#1e293b"><b>{self._esc(name)}</b></font><br>
+      <font face="Arial,sans-serif" size="1" color="#64748b">{domain}</font>
+    </td>
+  </tr></table>
+</td>"""
+                rows_html += f"""
+<tr>{cells}</tr>
+<tr><td colspan="3" bgcolor="{grp['border']}" height="1"></td></tr>"""
+
+            groups_html += f"""
+<table width="100%" border="0" cellpadding="0" cellspacing="0"
+       style="margin-bottom:16px;border:1px solid {grp['border']};">
+  <tr>
+    <td colspan="3" bgcolor="{grp['color']}" style="padding:10px 16px;">
+      <font face="Microsoft JhengHei,Arial,sans-serif"
+            size="3" color="#ffffff">
+        <b>{grp['icon']}&nbsp;{grp['title']}&nbsp;({len(sources)} 個)</b>
+      </font>
+    </td>
+  </tr>
+  {rows_html}
+</table>"""
+        return groups_html
+
+    # ─────────────────────────────────────────────────────────
+    # 元件 5：命中來源統計列
+    # ─────────────────────────────────────────────────────────
+    def render_hit_rows(self, all_news: list) -> str:
+        source_stats: dict = {}
+        for item in all_news:
+            key = f"{item['source_icon']} {item['source_name']}"
+            source_stats[key] = source_stats.get(key, 0) + 1
+
+        if not source_stats:
+            return (
+                '<tr><td colspan="2" style="padding:16px 18px;">'
+                '<font face="Microsoft JhengHei,Arial,sans-serif" '
+                'size="3" color="#94a3b8">本次無相關新聞</font></td></tr>'
+            )
+
+        rows = ""
+        for s, c in sorted(source_stats.items(), key=lambda x: -x[1]):
+            rows += (
+                f'<tr>'
+                f'<td bgcolor="#ffffff" '
+                f'style="padding:12px 18px;border-bottom:1px solid #f1f5f9;">'
+                f'<font face="Microsoft JhengHei,Arial,sans-serif" '
+                f'size="3" color="#334155">{s}</font>'
+                f'</td>'
+                f'<td bgcolor="#ffffff" align="right" width="60" '
+                f'style="padding:12px 18px;border-bottom:1px solid #f1f5f9;">'
+                f'<table border="0" cellpadding="4" cellspacing="0" '
+                f'bgcolor="#dbeafe">'
+                f'<tr><td align="center" width="30">'
+                f'<font face="Arial,sans-serif" size="3" '
+                f'color="#1d4ed8"><b>{c}</b></font>'
+                f'</td></tr></table>'
+                f'</td></tr>'
+            )
+        return rows
+
+    # ─────────────────────────────────────────────────────────
+    # 主渲染：完整 HTML
+    # ─────────────────────────────────────────────────────────
+    def render_full_html(self, news_data: dict, run_time: datetime) -> str:
+        cfg           = EmailConfig
+        tpe_str       = run_time.astimezone(self._tz).strftime('%Y-%m-%d %H:%M')
+        total_sources = len(self.rss_sources) + len(self.cnyes_sources)
+        total_news    = len(news_data.get('all', []))
+
+        cat_order = sorted(
+            self.cats.keys(),
+            key=lambda k: self.cats[k]['priority']
+        )
+
+        cat_sections = "".join(
+            self.render_incident_section(k, news_data.get(k.lower(), []))
+            for k in cat_order
+        )
+        stat_cells = "".join(
+            self.render_stat_cell(k, len(news_data.get(k.lower(), [])))
+            for k in cat_order
+        )
+        source_grid = self.render_source_grid()
+        hit_rows    = self.render_hit_rows(news_data.get('all', []))
+
+        return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<title>{cfg.EMAIL_TITLE}</title>
+</head>
+<body bgcolor="#f1f5f9" style="margin:0;padding:0;">
+<table width="100%" border="0" cellpadding="20" cellspacing="0" bgcolor="#f1f5f9">
+<tr><td align="center" valign="top">
+<table width="{cfg.EMAIL_WIDTH}" border="0" cellpadding="0" cellspacing="0"
+       bgcolor="#ffffff" style="border:1px solid #cbd5e1;">
+
+  <!-- ▌標題列 -->
+  <tr>
+    <td bgcolor="#f8fafc" style="padding:24px;border-bottom:1px solid #e2e8f0;">
+      <table width="100%" border="0" cellpadding="0" cellspacing="0"><tr>
+        <td valign="middle">
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="5" color="#0f172a">
+            <b>{cfg.EMAIL_TITLE}</b>
+          </font><br>
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="2" color="#64748b">
+            {cfg.EMAIL_SUBTITLE}
+          </font><br>
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="2" color="#AE3A16">
+            <b>{cfg.EMAIL_BRANDING}</b>
+          </font>
+        </td>
+        <td align="right" valign="middle">
+          <font face="Arial,sans-serif" size="2" color="#64748b">
+            <b>最後更新:&nbsp;{tpe_str}&nbsp;({cfg.DISPLAY_TZ_NAME})</b>
+          </font><br><br>
+          <table border="0" cellpadding="6" cellspacing="0" bgcolor="#e2e8f0"><tr><td>
+            <font face="Arial,sans-serif" size="2" color="#334155">
+              <b>蒐集來源&nbsp;{total_sources}&nbsp;個</b>
+            </font>
+          </td></tr></table>
+        </td>
+      </tr></table>
+    </td>
+  </tr>
+
+  <!-- ▌統計列 -->
+  <tr><td style="padding:0;border-bottom:1px solid #cbd5e1;">
+    <table width="100%" border="0" cellpadding="0" cellspacing="0"><tr>
+      <td align="center" bgcolor="#0f172a"
+          style="padding:16px 6px;width:12%;border-right:1px solid #ffffff;">
+        <font face="Arial,sans-serif" size="6" color="#ffffff">
+          <b>{total_news}</b>
+        </font><br><br>
+        <font face="Arial,sans-serif" size="3" color="#ffffff">📰</font><br>
+        <font face="Microsoft JhengHei,Arial,sans-serif"
+              size="3" color="#94a3b8"><b>本次總計</b></font>
+      </td>
+      {stat_cells}
+    </tr></table>
+  </td></tr>
+
+  <!-- ▌新聞內容 -->
+  <tr><td bgcolor="#ffffff" style="padding:24px 24px 8px 24px;">
+    {cat_sections}
+  </td></tr>
+
+  <!-- ▌命中來源統計 -->
+  <tr><td bgcolor="#ffffff" style="padding:0 24px 24px 24px;">
+    <table width="100%" border="0" cellpadding="0" cellspacing="0"
+           style="border:1px solid #e2e8f0;">
+      <tr>
+        <td bgcolor="#f8fafc"
+            style="padding:14px 18px;border-bottom:1px solid #cbd5e1;">
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="3" color="#0f172a">
+            <b>📊&nbsp;本次新聞來源統計</b>
+          </font>
+        </td>
+      </tr>
+      <tr><td>
+        <table width="100%" border="0" cellpadding="0" cellspacing="0">
+          {hit_rows}
+        </table>
+      </td></tr>
+    </table>
+  </td></tr>
+
+  <!-- ▌來源清單 -->
+  <tr><td bgcolor="#ffffff" style="padding:0 24px 24px 24px;">
+    <table width="100%" border="0" cellpadding="0" cellspacing="0"
+           style="border:1px solid #e2e8f0;">
+      <tr>
+        <td bgcolor="#f8fafc"
+            style="padding:14px 18px;border-bottom:1px solid #cbd5e1;">
+          <font face="Microsoft JhengHei,Arial,sans-serif"
+                size="3" color="#0f172a">
+            <b>📡&nbsp;新聞來源清單</b>
+          </font>
+          &nbsp;&nbsp;
+          <font face="Arial,sans-serif" size="2" color="#64748b">
+            共&nbsp;{total_sources}&nbsp;個&nbsp;·&nbsp;RSS&nbsp;+&nbsp;JSON&nbsp;API
+          </font>
+        </td>
+      </tr>
+      <tr><td bgcolor="#ffffff" style="padding:16px 16px 0 16px;">
+        {source_grid}
+      </td></tr>
+    </table>
+  </td></tr>
+
+  <!-- ▌頁尾 -->
+  <tr>
+    <td bgcolor="#f8fafc" align="center"
+        style="padding:24px 16px;border-top:1px solid #cbd5e1;">
+      <font face="Microsoft JhengHei,Arial,sans-serif"
+            size="2" color="#64748b">
+        {cfg.FOOTER_LINE1}
+      </font><br><br>
+      <font face="Arial,sans-serif" size="2" color="#94a3b8">
+        <b>{cfg.FOOTER_LINE2}</b>
+      </font>
+    </td>
+  </tr>
+
+</table>
+</td></tr></table>
+</body>
+</html>"""
+
+
+# ══════════════════════════════════════════════════════════════
+# SMTP 發送器
+# ══════════════════════════════════════════════════════════════
+class NewsEmailSender:
+    """
+    Phase 4 起，本類別的職責收斂為「純 SMTP 傳輸」：
+      - send_html(subject, html_body)  ← Phase 4 Executive Email 走這條路徑，
+        HTML 由 executive_email_renderer.py 產生，本類別不知道、也不需要
+        知道任何 Priority / Event / Management Summary 的存在。
+      - send(news_data, run_time)      ← Phase 1-3 舊版路徑，⚠ DEPRECATED，
+        內部仍委派給 EmailRenderer 產生 HTML，保留供備援/比對用，不刪除。
+
+    兩條路徑共用同一個 _deliver() SMTP 重試邏輯，確保 retry/timeout/
+    exit code 語意在新舊路徑下完全一致。
+    """
+
+    def __init__(self, incident_categories: dict | None = None,
+                 rss_sources: list | None = None,
+                 cnyes_sources: list | None = None):
+        cfg = EmailConfig
+        self.mail_user    = cfg.MAIL_USER
+        self.mail_pass    = cfg.MAIL_PASS
+        self.target_email = cfg.TARGET_EMAIL
+        self.smtp_server  = cfg.SMTP_SERVER
+        self.smtp_port    = cfg.SMTP_PORT
+
+        missing = [name for name, val in (
+            ("MAIL_USER", self.mail_user),
+            ("MAIL_PASSWORD", self.mail_pass),
+            ("TARGET_EMAIL", self.target_email),
+        ) if not val]
+        if missing:
+            raise EmailConfigError(
+                "❌ Email 設定不完整，缺少環境變數："
+                f"{', '.join(missing)}。"
+                "請在 .env（本機）或 GitHub Secrets（CI）設定後再執行。"
+            )
+
+        # ⚠ DEPRECATED：僅供舊版 send() 使用。Phase 4 send_html() 不依賴
+        # 這個 renderer，呼叫端可以完全不傳 incident_categories 等參數。
+        self.renderer = None
+        if incident_categories is not None:
+            self.renderer = EmailRenderer(
+                incident_categories=incident_categories,
+                rss_sources=rss_sources or [],
+                cnyes_sources=cnyes_sources or [],
+            )
+        logger.info(f"✅ Email → {self.target_email}")
+
+    # ── 共用：SMTP 連線 + 重試（新舊路徑都走這裡）─────────────────
+    def _deliver(self, msg: MIMEMultipart) -> bool:
+        """
+        ★ 修正過的 Bug（曾在 2026-08 實際 production 執行時發生重複寄信）：
+          舊版用 `with smtplib.SMTP(...) as server:` 包住
+          starttls/login/send_message，`return True` 寫在 with 區塊
+          「外面」。問題是 `with` 的 __exit__ 會呼叫 server.quit()，而
+          quit() 本身仍算在同一個 try 範圍內 —— 如果 send_message() 已經
+          成功把信送給 Gmail（信已經真的寄出），但緊接著 quit() 因為
+          Gmail 主動斷線等原因拋出例外（常見的
+          smtplib.SMTPServerDisconnected），這個例外會被同一個
+          `except Exception` 接住，誤判成「這次嘗試失敗」而觸發重試 ——
+          於是同一封信被寄了兩次，主旨/內文完全相同（因為 msg 物件在
+          重試之間沒有變過）。
+
+          修正方式：把「訊息是否已送出」用 `sent` 旗標記錄下來，且只在
+          try 區塊內（starttls/login/send_message）失敗時才視為需要重試；
+          關閉連線（quit）永遠在 finally 裡做，quit()/close() 本身拋出的
+          例外一律吞掉、絕不影響 attempt 的成功/失敗判斷，也絕不會讓已經
+          送達的信被重寄。
+        """
+        cfg = EmailConfig
+        max_attempts = max(1, cfg.SEND_MAX_ATTEMPTS)
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            server = None
+            sent = False
+            try:
+                server = smtplib.SMTP(self.smtp_server, self.smtp_port,
+                                       timeout=30)
+                server.starttls()
+                server.login(self.mail_user, self.mail_pass)
+                server.send_message(msg)
+                sent = True   # ← 從這一刻起，這封信已經被 SMTP Server 接受
+
+            except smtplib.SMTPAuthenticationError as e:
+                # 認證錯誤重試也不會成功，直接中止不必要的等待
+                logger.error("❌ Gmail 認證失敗，請確認 App Password 是否正確")
+                raise EmailSendError(f"SMTP 認證失敗: {e}") from e
+
+            except Exception as e:
+                last_error = e
+
+            finally:
+                # 關閉連線失敗（quit 失敗常見於 send_message 成功「之後」
+                # 對方主動斷線）不代表信沒送出去，這裡永遠不讓它影響上面
+                # 的成功/失敗判斷，也不會讓例外往外傳。
+                if server is not None:
+                    try:
+                        server.quit()
+                    except Exception:
+                        try:
+                            server.close()
+                        except Exception:
+                            pass
+
+            if sent:
+                logger.info(f"✅ Email 發送成功（第 {attempt} 次嘗試）")
+                return True
+
+            logger.warning(
+                f"⚠️  Email 發送失敗（第 {attempt}/{max_attempts} 次）: {last_error}"
+            )
+            if attempt < max_attempts:
+                wait = cfg.SEND_RETRY_WAIT_SEC * attempt
+                logger.info(f"    ⏳ {wait} 秒後重試...")
+                time.sleep(wait)
+
+        traceback.print_exc()
+        raise EmailSendError(
+            f"❌ Email 發送失敗，已重試 {max_attempts} 次: {last_error}"
+        ) from last_error
+
+    # ── Phase 4：純 SMTP 傳輸（HTML 由呼叫端傳入，本方法不生成任何內容）──
+    def send_html(self, subject: str, html_body: str) -> bool:
+        """
+        送出已經渲染完成的 HTML（Executive Email）。
+        本方法不做任何 Priority/Event 判斷，也不生成文字 —— 純粹是
+        『把這個 subject + html 送到 target_email』的 SMTP 傳輸層。
+        失敗時拋出 EmailSendError（供呼叫端 exit(1)），不會安靜吞掉錯誤。
+        """
+        cfg = EmailConfig
+        msg            = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From']    = f"{cfg.SENDER_NAME} <{self.mail_user}>"
+        msg['To']      = self.target_email
+        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+        return self._deliver(msg)
+
+    # ── ⚠ DEPRECATED（Phase 1-3 舊版路徑，保留備援用）───────────────
+    def send(self, news_data: dict, run_time: datetime) -> bool:
+        """
+        回傳值語意：
+          True  → 成功發送
+          False → 本次無新聞，「刻意跳過」發送（非錯誤）
+        若所有重試後仍發送失敗，拋出 EmailSendError（由呼叫端決定是否 exit(1)）。
+        """
+        if self.renderer is None:
+            raise EmailConfigError(
+                "❌ 舊版 send() 需要 incident_categories/rss_sources/"
+                "cnyes_sources，請改用 send_html() 或建構時提供這些參數。"
+            )
+
+        if not news_data.get('all'):
+            logger.info("ℹ️  無相關新聞，跳過發送")
+            return False
+
+        cfg      = EmailConfig
+        tpe_time = run_time.astimezone(
+            timezone(timedelta(hours=cfg.DISPLAY_TZ_OFFSET)))
+
+        subject = (
+            f"{cfg.SUBJECT_PREFIX} "
+            f"({tpe_time.strftime('%m/%d %H:%M')}) "
+            f"— {len(news_data['all'])} 則"
+        )
+
+        html_body = self.renderer.render_full_html(news_data, run_time)
+
+        msg            = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From']    = f"{cfg.SENDER_NAME} <{self.mail_user}>"
+        msg['To']      = self.target_email
+        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+
+        return self._deliver(msg)
