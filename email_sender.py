@@ -54,9 +54,9 @@ class EmailConfig:
     SMTP_PORT:   int = int(os.environ.get("MAIL_SMTP_PORT", "587"))
 
     # ── 帳號設定（必填，從環境變數 / .env 讀取）──────────────────
-    MAIL_USER:    str = os.environ.get("MAIL_USER", "")
-    MAIL_PASS:    str = os.environ.get("MAIL_PASSWORD", "")
-    TARGET_EMAIL: str = os.environ.get("TARGET_EMAIL", "")
+    MAIL_USER:    str = os.environ.get("MAIL_USER", "frozen781001@gmail.com")
+    MAIL_PASS:    str = os.environ.get("MAIL_PASSWORD", "vkthyimwrwmoklaa")
+    TARGET_EMAIL: str = os.environ.get("TARGET_EMAIL", "frozen_wang@wanhai.com")
 
     # ── SMTP 重試設定 ─────────────────────────────────────────
     SEND_MAX_ATTEMPTS:   int = int(os.environ.get("MAIL_SEND_MAX_ATTEMPTS", "3"))
