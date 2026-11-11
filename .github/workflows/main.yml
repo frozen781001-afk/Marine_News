@@ -432,30 +432,10 @@ jobs:
       # State 已經盡力保存、Summary 已經寫完，最後才反映真實結果，
       # 讓 GitHub Actions 的 ✅/❌ 準確代表這次執行是否成功。
       - name: Reflect real pass/fail
-  if: always()
-  run: |
-    RESULT="${{ steps.run_main.outcome }}"
-
-    if [ "$RESULT" = "success" ]; then
-      echo "✅ maritime_news.py completed successfully."
-      exit 0
-    fi
-
-    if [ "$RESULT" = "failure" ]; then
-      echo "❌ maritime_news.py executed but failed."
-      exit 1
-    fi
-
-    if [ "${{ steps.verify_restore.outcome }}" = "failure" ]; then
-      echo "❌ maritime_news.py was not executed because restored SQLite state failed validation."
-      exit 1
-    fi
-
-    if [ "${{ steps.preflight.outcome }}" = "failure" ]; then
-      echo "❌ maritime_news.py was not executed because Preflight health check failed."
-      echo "Check MAIL_USER, MAIL_PASSWORD, TARGET_EMAIL and the health-check output above."
-      exit 1
-    fi
-
-    echo "❌ maritime_news.py was skipped because an earlier workflow step failed."
-    exit 1
+        if: always()
+        run: |
+          if [ "${{ steps.run_main.outcome }}" != "success" ]; then
+            echo "❌ maritime_news.py did not complete successfully — failing this job."
+            exit 1
+          fi
+          echo "✅ maritime_news.py completed successfully."
